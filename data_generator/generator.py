@@ -2,6 +2,8 @@
 Synthetic Access Log Generator Microservice
 Streams realistic access logs with habitual patterns and injected security attack scenarios
 to the Apache Kafka 'raw-logs' topic in near real-time.
+
+Configured for ~60 logs/minute with 2.5% weighted anomaly injection rate.
 """
 
 import os
@@ -28,8 +30,8 @@ fake = Faker()
 # Configuration from Environment Variables
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC_RAW_LOGS = os.getenv("TOPIC_RAW_LOGS", "raw-logs")
-STREAM_INTERVAL_SEC = float(os.getenv("STREAM_INTERVAL_SEC", "0.5"))
-ANOMALY_PROBABILITY = float(os.getenv("ANOMALY_PROBABILITY", "0.15"))
+STREAM_INTERVAL_SEC = float(os.getenv("STREAM_INTERVAL_SEC", "1.0"))  # 60 logs per minute
+ANOMALY_PROBABILITY = float(os.getenv("ANOMALY_PROBABILITY", "0.025"))  # 2.5% anomaly rate
 
 ROLE_COUNTS = {
     "Software Engineer": 45,
@@ -125,11 +127,9 @@ ROLE_PROFILES: Dict[str, Dict[str, Any]] = {
 
 
 def build_entity_registry() -> Dict[str, Dict[str, Any]]:
-    """Generates entity baseline definitions for 160 users, 20 service accounts, 20 edge devices."""
     entities = {}
     user_id_counter = 101
 
-    # Users
     for role, count in ROLE_COUNTS.items():
         for _ in range(count):
             e_id = f"USR_{user_id_counter}"
@@ -147,7 +147,6 @@ def build_entity_registry() -> Dict[str, Dict[str, Any]]:
             }
             user_id_counter += 1
 
-    # Service Accounts
     for i in range(1, NUM_SERVICE_ACCOUNTS + 1):
         e_id = f"SVC_{i:03d}"
         lat = float(fake.latitude())
@@ -172,7 +171,6 @@ def build_entity_registry() -> Dict[str, Dict[str, Any]]:
             "base_lon": lon
         }
 
-    # Edge Devices
     for i in range(1, NUM_EDGE_DEVICES + 1):
         e_id = f"EDG_{i:03d}"
         lat = float(fake.latitude())
@@ -233,57 +231,52 @@ def generate_normal_event(entity: Dict[str, Any], timestamp: datetime) -> Dict[s
 
 
 def generate_attack_event(entities: Dict[str, Dict[str, Any]], timestamp: datetime) -> List[Dict[str, Any]]:
-    attack_type = random.choice([
-        "brute_force",
-        "impossible_travel",
-        "credential_stuffing",
-        "lateral_movement",
-        "device_spoofing",
-        "low_and_slow_exfiltration"
-    ])
+    # Weighted attack type sampling (Non-equal probability)
+    attack_types = [
+        "brute_force",               # 35%
+        "credential_stuffing",       # 25%
+        "lateral_movement",          # 15%
+        "low_and_slow_exfiltration", # 10%
+        "device_spoofing",           # 10%
+        "impossible_travel"          # 5%
+    ]
+    weights = [0.35, 0.25, 0.15, 0.10, 0.10, 0.05]
+    attack_type = random.choices(attack_types, weights=weights, k=1)[0]
     events = []
 
     if attack_type == "brute_force":
         bf_candidates = [e_id for e_id, info in entities.items() if info["role"] in ["Intern / New Hire", "General Admin"]]
         target_id = random.choice(bf_candidates)
         target = entities[target_id]
-        attacker_ip = fake.ipv4_public()
-        attacker_mac = fake.mac_address()
-        for i in range(10):  # Burst of failed logins
-            is_last = (i == 9)
-            cmd_seq = ["login_attempt", "auth_success", "read_file", "logout"] if is_last else ["login_attempt", "auth_fail"]
-            events.append({
-                "entity_id": target_id,
-                "entity_type": target["entity_type"],
-                "role": target["role"],
-                "timestamp": (timestamp + timedelta(seconds=i * 2)).strftime("%Y-%m-%d %H:%M:%S"),
-                "source_ip": attacker_ip,
-                "geo_location": f"{fake.city()}, {fake.country()}",
-                "geo_lat": float(fake.latitude()),
-                "geo_lon": float(fake.longitude()),
-                "resource_accessed": random.choice(target["profile"]["resources"]),
-                "auth_method": "password",
-                "auth_result": "success" if is_last else "fail",
-                "session_duration_sec": 2,
-                "command_sequence": cmd_seq,
-                "device_fingerprint": target["profile"]["devices"][0],
-                "mac_address": attacker_mac,
-                "label": "brute_force",
-                "deviation_source": "auth_result, timing, source_ip, mac_address"
-            })
+        events.append({
+            "entity_id": target_id,
+            "entity_type": target["entity_type"],
+            "role": target["role"],
+            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "source_ip": fake.ipv4_public(),
+            "geo_location": f"{fake.city()}, {fake.country()}",
+            "geo_lat": float(fake.latitude()),
+            "geo_lon": float(fake.longitude()),
+            "resource_accessed": random.choice(target["profile"]["resources"]),
+            "auth_method": "password",
+            "auth_result": "fail",
+            "session_duration_sec": 2,
+            "command_sequence": ["login_attempt", "auth_fail"],
+            "device_fingerprint": target["profile"]["devices"][0],
+            "mac_address": fake.mac_address(),
+            "label": "brute_force",
+            "deviation_source": "auth_result, timing, source_ip, mac_address"
+        })
 
     elif attack_type == "impossible_travel":
         exec_candidates = [e_id for e_id, info in entities.items() if info["role"] == "Executive"]
         target_id = random.choice(exec_candidates)
         target = entities[target_id]
-        # Event 1: Normal baseline location
-        events.append(generate_normal_event(target, timestamp))
-        # Event 2: 5 minutes later in Tokyo, Japan
         events.append({
             "entity_id": target_id,
             "entity_type": "user",
             "role": target["role"],
-            "timestamp": (timestamp + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             "source_ip": fake.ipv4_public(),
             "geo_location": "Tokyo, Japan",
             "geo_lat": 35.6762,
@@ -301,56 +294,51 @@ def generate_attack_event(entities: Dict[str, Dict[str, Any]], timestamp: dateti
 
     elif attack_type == "credential_stuffing":
         user_candidates = [e_id for e_id, info in entities.items() if info["entity_type"] == "user"]
-        targets = random.sample(user_candidates, min(5, len(user_candidates)))
-        cs_ip = fake.ipv4_public()
-        cs_mac = fake.mac_address()
-        for idx, t_id in enumerate(targets):
-            target = entities[t_id]
-            events.append({
-                "entity_id": t_id,
-                "entity_type": target["entity_type"],
-                "role": target["role"],
-                "timestamp": (timestamp + timedelta(seconds=idx * 3)).strftime("%Y-%m-%d %H:%M:%S"),
-                "source_ip": cs_ip,
-                "geo_location": f"{fake.city()}, {fake.country()}",
-                "geo_lat": float(fake.latitude()),
-                "geo_lon": float(fake.longitude()),
-                "resource_accessed": target["profile"]["resources"][0],
-                "auth_method": "password",
-                "auth_result": "fail" if random.random() < 0.9 else "success",
-                "session_duration_sec": 1,
-                "command_sequence": ["login_attempt", "auth_fail"],
-                "device_fingerprint": "Automated Python Script / Bot",
-                "mac_address": cs_mac,
-                "label": "credential_stuffing",
-                "deviation_source": "source_ip, mac_address, auth_result"
-            })
+        t_id = random.choice(user_candidates)
+        target = entities[t_id]
+        events.append({
+            "entity_id": t_id,
+            "entity_type": target["entity_type"],
+            "role": target["role"],
+            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "source_ip": fake.ipv4_public(),
+            "geo_location": f"{fake.city()}, {fake.country()}",
+            "geo_lat": float(fake.latitude()),
+            "geo_lon": float(fake.longitude()),
+            "resource_accessed": target["profile"]["resources"][0],
+            "auth_method": "password",
+            "auth_result": "fail",
+            "session_duration_sec": 1,
+            "command_sequence": ["login_attempt", "auth_fail"],
+            "device_fingerprint": "Automated Python Script / Bot",
+            "mac_address": fake.mac_address(),
+            "label": "credential_stuffing",
+            "deviation_source": "source_ip, mac_address, auth_result"
+        })
 
     elif attack_type == "lateral_movement":
         eng_candidates = [e_id for e_id, info in entities.items() if info["role"] == "Software Engineer"]
         target_id = random.choice(eng_candidates)
         target = entities[target_id]
-        unauthorized_resources = ["payroll-db", "erp-corporate", "firewall-config-console", "board-strategy-docs", "auth-server-logs"]
-        for idx, res in enumerate(unauthorized_resources):
-            events.append({
-                "entity_id": target_id,
-                "entity_type": "user",
-                "role": target["role"],
-                "timestamp": (timestamp + timedelta(minutes=idx * 2)).strftime("%Y-%m-%d %H:%M:%S"),
-                "source_ip": get_session_ip(target["profile"]),
-                "geo_location": target["base_geo"],
-                "geo_lat": target["base_lat"],
-                "geo_lon": target["base_lon"],
-                "resource_accessed": res,
-                "auth_method": "ssh_key",
-                "auth_result": "success",
-                "session_duration_sec": 180,
-                "command_sequence": ["login", "open_firewall_console", "modify_rules", "export_logs", "logout"],
-                "device_fingerprint": target["profile"]["devices"][0],
-                "mac_address": target["base_mac"],
-                "label": "lateral_movement",
-                "deviation_source": "resource_accessed, command_sequence"
-            })
+        events.append({
+            "entity_id": target_id,
+            "entity_type": "user",
+            "role": target["role"],
+            "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "source_ip": get_session_ip(target["profile"]),
+            "geo_location": target["base_geo"],
+            "geo_lat": target["base_lat"],
+            "geo_lon": target["base_lon"],
+            "resource_accessed": "payroll-db",
+            "auth_method": "ssh_key",
+            "auth_result": "success",
+            "session_duration_sec": 180,
+            "command_sequence": ["login", "open_firewall_console", "modify_rules", "logout"],
+            "device_fingerprint": target["profile"]["devices"][0],
+            "mac_address": target["base_mac"],
+            "label": "lateral_movement",
+            "deviation_source": "resource_accessed, command_sequence"
+        })
 
     elif attack_type == "device_spoofing":
         edge_candidates = [e_id for e_id, info in entities.items() if info["entity_type"] == "edge_device"]
@@ -404,7 +392,6 @@ def generate_attack_event(entities: Dict[str, Dict[str, Any]], timestamp: dateti
 
 
 def create_kafka_producer() -> KafkaProducer:
-    """Connects to Kafka bootstrap server with retry logic."""
     producer = None
     while producer is None:
         try:
@@ -423,7 +410,7 @@ def create_kafka_producer() -> KafkaProducer:
 
 
 def main():
-    logger.info("Starting Synthetic Data Generator Microservice...")
+    logger.info("Starting Synthetic Data Generator Microservice (~60 logs/min, 2.5% anomaly rate)...")
     entities = build_entity_registry()
     entity_keys = list(entities.keys())
     producer = create_kafka_producer()
@@ -441,8 +428,8 @@ def main():
             for event in batch:
                 producer.send(TOPIC_RAW_LOGS, value=event)
                 count += 1
-                if count % 50 == 0:
-                    logger.info(f"Published {count} events to topic '{TOPIC_RAW_LOGS}' (Latest Entity: {event['entity_id']}, Label: {event['label']})")
+                if count % 20 == 0:
+                    logger.info(f"Streamed {count} logs to topic '{TOPIC_RAW_LOGS}' (Latest: {event['entity_id']}, Label: {event['label']})")
 
             producer.flush()
             time.sleep(STREAM_INTERVAL_SEC)

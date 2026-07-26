@@ -1,10 +1,3 @@
-,0
-command_novelty_score,0.0
-resource_novelty_score,0.0
-device_novelty_score,0.0
-duration_zscore,-1.0288217437972428e-18
-time_unusualness_score,2.762818924548409
-geo_velocity_zscore,67.9872294575282
-hour_sin,-0.28839026299339476
-hour_cos,0.16984289281509693
-recent_failed_auth_count,2.2057891438389298e-05
+version https://git-lfs.github.com/spec/v1
+oid sha256:fbe24de955c41931f7048a827f4e42aa8b54fb76b9c35d1a889efa941c7d7641
+size 306

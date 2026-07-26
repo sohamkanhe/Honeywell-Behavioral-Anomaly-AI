@@ -1,7 +1,7 @@
 """
 FastAPI Backend & SOC Analyst Dashboard Microservice
 Provides REST & WebSocket APIs for real-time security alerts, XAI feature attributions,
-entity behavioral sequence timelines, and system metrics. Serves React UI static files.
+entity behavioral sequence timelines, system metrics, manual alert acknowledgments, and analytics.
 """
 
 import os
@@ -14,7 +14,7 @@ from datetime import datetime
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -39,7 +39,7 @@ TOPIC_SCORED_ALERTS = os.getenv("TOPIC_SCORED_ALERTS", "scored-alerts")
 app = FastAPI(
     title="UEBA Behavioral Anomaly Detection & XAI SOC Dashboard",
     description="Real-time SOC Analyst Dashboard API for UEBA Anomaly Detection & SHAP Explainability",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # Enable CORS
@@ -62,7 +62,6 @@ def get_pg_connection():
     )
 
 
-# WebSocket Connection Manager
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -99,6 +98,9 @@ def get_system_metrics():
         cur.execute("SELECT COUNT(*) as high_risk_count FROM alerts WHERE risk_score >= 7.0;")
         high_risk = cur.fetchone()["high_risk_count"]
 
+        cur.execute("SELECT COUNT(*) as ack_count FROM alerts WHERE status = 'ACKNOWLEDGED';")
+        acknowledged = cur.fetchone()["ack_count"]
+
         cur.execute("SELECT COUNT(DISTINCT entity_id) as active_entities FROM alerts;")
         active_entities = cur.fetchone()["active_entities"]
 
@@ -110,6 +112,7 @@ def get_system_metrics():
                 "total_logs_processed": 0,
                 "total_alerts_flagged": 0,
                 "high_risk_anomalies": 0,
+                "acknowledged_alerts": 0,
                 "active_entities_count": 200,
                 "avg_inference_latency_ms": 14.5
             }
@@ -118,38 +121,56 @@ def get_system_metrics():
             "total_logs_processed": row.get("total_logs_processed", 0),
             "total_alerts_flagged": row.get("total_alerts_flagged", 0),
             "high_risk_anomalies": high_risk,
+            "acknowledged_alerts": acknowledged,
             "active_entities_count": max(active_entities, row.get("active_entities_count", 200)),
             "avg_inference_latency_ms": row.get("avg_inference_latency_ms", 14.5)
         }
     except Exception as e:
         logger.error(f"Error fetching metrics: {e}")
         return {
-            "total_logs_processed": 15420,
-            "total_alerts_flagged": 48,
-            "high_risk_anomalies": 12,
+            "total_logs_processed": 0,
+            "total_alerts_flagged": 0,
+            "high_risk_anomalies": 0,
+            "acknowledged_alerts": 0,
             "active_entities_count": 200,
-            "avg_inference_latency_ms": 14.2
+            "avg_inference_latency_ms": 14.5
         }
 
 
 @app.get("/api/alerts")
 def get_ranked_alerts(
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(100, ge=1, le=500),
     sort_by: str = Query("risk_score", regex="^(risk_score|timestamp)$"),
     order: str = Query("desc", regex="^(asc|desc)$"),
-    anomaly_type: Optional[str] = None
+    anomaly_type: Optional[str] = None,
+    min_risk: Optional[float] = None,
+    search: Optional[str] = None,
+    status: Optional[str] = None
 ):
-    """Returns ranked alert queue sortable by 1-10 risk score or timestamp."""
+    """Returns ranked alert queue filterable by risk threshold, threat type, search query, and status."""
     try:
         conn = get_pg_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
-        query = "SELECT id, alert_id, timestamp, entity_id, entity_type, role, anomaly_type, risk_score, point_error, seq_error, source_ip, geo_location, resource_accessed, status FROM alerts"
+        query = "SELECT id, alert_id, timestamp, entity_id, entity_type, role, anomaly_type, risk_score, point_error, seq_error, source_ip, geo_location, resource_accessed, status FROM alerts WHERE 1=1"
         params = []
 
         if anomaly_type:
-            query += " WHERE anomaly_type = %s"
+            query += " AND anomaly_type = %s"
             params.append(anomaly_type)
+
+        if min_risk is not None:
+            query += " AND risk_score >= %s"
+            params.append(min_risk)
+
+        if status:
+            query += " AND status = %s"
+            params.append(status)
+
+        if search and search.strip():
+            s = f"%{search.strip()}%"
+            query += " AND (entity_id ILIKE %s OR alert_id ILIKE %s OR source_ip ILIKE %s OR resource_accessed ILIKE %s OR role ILIKE %s)"
+            params.extend([s, s, s, s, s])
 
         query += f" ORDER BY {sort_by} {order.upper()} LIMIT %s;"
         params.append(limit)
@@ -159,7 +180,6 @@ def get_ranked_alerts(
         cur.close()
         conn.close()
 
-        # Convert timestamp to ISO string format
         alerts = []
         for r in rows:
             r_dict = dict(r)
@@ -197,6 +217,81 @@ def get_alert_detail(alert_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert(alert_id: str):
+    """Updates an alert status to ACKNOWLEDGED in PostgreSQL and broadcasts update."""
+    try:
+        conn = get_pg_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("UPDATE alerts SET status = 'ACKNOWLEDGED' WHERE alert_id = %s RETURNING *;", (alert_id,))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Alert not found")
+
+        updated_alert = dict(row)
+        if isinstance(updated_alert["timestamp"], datetime):
+            updated_alert["timestamp"] = updated_alert["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+
+        # Broadcast status update event
+        await manager.broadcast({
+            "event_type": "ALERT_ACKNOWLEDGED",
+            "alert": updated_alert
+        })
+
+        return {"status": "success", "alert_id": alert_id, "new_status": "ACKNOWLEDGED"}
+    except Exception as e:
+        logger.error(f"Error acknowledging alert: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/charts/summary")
+def get_charts_summary():
+    """Returns analytics data for SOC Dashboard charts (threat distribution, risk histogram, top targets)."""
+    try:
+        conn = get_pg_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        # 1. Threat Type Distribution
+        cur.execute("SELECT anomaly_type, COUNT(*) as count FROM alerts GROUP BY anomaly_type ORDER BY count DESC;")
+        threat_dist = [dict(r) for r in cur.fetchall()]
+
+        # 2. Risk Score Histogram
+        cur.execute("""
+            SELECT 
+                CASE 
+                    WHEN risk_score >= 9.0 THEN 'Critical (9.0-10.0)'
+                    WHEN risk_score >= 7.0 THEN 'High (7.0-8.9)'
+                    WHEN risk_score >= 4.0 THEN 'Medium (4.0-6.9)'
+                    ELSE 'Low (1.0-3.9)'
+                END as risk_range,
+                COUNT(*) as count
+            FROM alerts
+            GROUP BY risk_range
+            ORDER BY min(risk_score) DESC;
+        """)
+        risk_hist = [dict(r) for r in cur.fetchall()]
+
+        # 3. Top 5 Targeted Entities
+        cur.execute("SELECT entity_id, role, COUNT(*) as alert_count FROM alerts GROUP BY entity_id, role ORDER BY alert_count DESC LIMIT 5;")
+        top_entities = [dict(r) for r in cur.fetchall()]
+
+        cur.close()
+        conn.close()
+
+        return {
+            "threat_distribution": threat_dist,
+            "risk_histogram": risk_hist,
+            "top_targeted_entities": top_entities
+        }
+    except Exception as e:
+        logger.error(f"Error fetching charts summary: {e}")
+        return {"threat_distribution": [], "risk_histogram": [], "top_targeted_entities": []}
+
+
 @app.get("/api/entities/{entity_id}/timeline")
 def get_entity_timeline(entity_id: str):
     """Returns historical event sequence & baseline metrics for entity timeline visualization."""
@@ -208,7 +303,7 @@ def get_entity_timeline(entity_id: str):
         baseline_row = cur.fetchone()
 
         cur.execute("""
-            SELECT alert_id, timestamp, anomaly_type, risk_score, source_ip, geo_location, resource_accessed, raw_log
+            SELECT alert_id, timestamp, anomaly_type, risk_score, source_ip, geo_location, resource_accessed, raw_log, status
             FROM alerts WHERE entity_id = %s ORDER BY timestamp DESC LIMIT 20;
         """, (entity_id,))
         alerts_rows = cur.fetchall()
@@ -284,7 +379,6 @@ async def websocket_alerts(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
-# Background task to consume Kafka scored-alerts and push to WebSocket clients
 async def kafka_ws_bridge():
     await asyncio.sleep(5)
     logger.info(f"Starting Kafka WS Bridge listening on '{TOPIC_SCORED_ALERTS}'...")
@@ -305,7 +399,10 @@ async def kafka_ws_bridge():
                 time.sleep(5)
 
         for msg in consumer:
-            asyncio.run_coroutine_threadsafe(manager.broadcast(msg.value), loop)
+            asyncio.run_coroutine_threadsafe(manager.broadcast({
+                "event_type": "NEW_ALERT",
+                "alert": msg.value
+            }), loop)
 
     loop.run_in_executor(None, consume_kafka)
 
@@ -315,7 +412,6 @@ async def startup_event():
     asyncio.create_task(kafka_ws_bridge())
 
 
-# Mount Static Files (Served from app/static)
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
@@ -331,7 +427,5 @@ def read_root():
     return JSONResponse({
         "system": "AI-Powered Behavioral Anomaly Detection System",
         "status": "Operational",
-        "docs": "/docs",
-        "api_metrics": "/api/metrics",
-        "api_alerts": "/api/alerts"
+        "docs": "/docs"
     })
