@@ -1,0 +1,6 @@
+kafka-python==2.0.2
+redis==5.0.1
+psycopg2-binary==2.9.9
+minio==7.2.3
+pandas==2.2.0
+numpy==1.26.3

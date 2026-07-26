@@ -1,0 +1,7 @@
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+psycopg2-binary==2.9.9
+kafka-python==2.0.2
+redis==5.0.1
+pydantic==2.6.1
+websockets==12.0

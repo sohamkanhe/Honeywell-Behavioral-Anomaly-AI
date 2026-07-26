@@ -1,0 +1,167 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: ueba-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - ueba-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: ueba-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - ueba-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: ueba-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    networks:
+      - ueba-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: ueba-postgres
+    environment:
+      POSTGRES_DB: anomaly_db
+      POSTGRES_USER: soc_user
+      POSTGRES_PASSWORD: soc_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init-scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    networks:
+      - ueba-network
+
+  minio:
+    image: minio/minio:RELEASE.2023-09-04T19-57-37Z
+    container_name: ueba-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    networks:
+      - ueba-network
+
+  generator:
+    build:
+      context: ./data_generator
+    container_name: ueba-generator
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC_RAW_LOGS: raw-logs
+      STREAM_INTERVAL_SEC: 0.5
+      ANOMALY_PROBABILITY: 0.15
+    networks:
+      - ueba-network
+
+  feature-worker:
+    build:
+      context: ./feature_worker
+    container_name: ueba-feature-worker
+    depends_on:
+      - kafka
+      - redis
+      - postgres
+      - minio
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC_RAW_LOGS: raw-logs
+      TOPIC_ENGINEERED_FEATURES: engineered-features
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: anomaly_db
+      POSTGRES_USER: soc_user
+      POSTGRES_PASSWORD: soc_password
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_COLD_BUCKET: cold-lake
+      BASELINES_PKL_PATH: /app/models_and_datasets/baselines.pkl
+      MEANS_CSV_PATH: /app/models_and_datasets/feature_means.csv
+      STDS_CSV_PATH: /app/models_and_datasets/feature_stds.csv
+      COLUMNS_JSON_PATH: /app/models_and_datasets/feature_columns.json
+    volumes:
+      - ./models_and_datasets:/app/models_and_datasets
+    networks:
+      - ueba-network
+
+  scoring-service:
+    build:
+      context: ./scoring_service
+    container_name: ueba-scoring-service
+    depends_on:
+      - kafka
+      - postgres
+      - minio
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC_ENGINEERED_FEATURES: engineered-features
+      TOPIC_SCORED_ALERTS: scored-alerts
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: anomaly_db
+      POSTGRES_USER: soc_user
+      POSTGRES_PASSWORD: soc_password
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_MODEL_BUCKET: ml-models
+      MODELS_LOCAL_DIR: /app/models_and_datasets
+      ALERT_ERROR_THRESHOLD: 0.25
+    volumes:
+      - ./models_and_datasets:/app/models_and_datasets
+    networks:
+      - ueba-network
+
+  dashboard:
+    build:
+      context: ./dashboard_service
+    container_name: ueba-dashboard
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - kafka
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: anomaly_db
+      POSTGRES_USER: soc_user
+      POSTGRES_PASSWORD: soc_password
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC_SCORED_ALERTS: scored-alerts
+    networks:
+      - ueba-network
+
+networks:
+  ueba-network:
+    driver: bridge

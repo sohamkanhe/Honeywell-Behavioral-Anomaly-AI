@@ -1,0 +1,10 @@
+,0
+command_novelty_score,1.0
+resource_novelty_score,1.0
+device_novelty_score,1.0
+duration_zscore,0.9993665213911529
+time_unusualness_score,0.6740928331876792
+geo_velocity_zscore,8106.0774147590555
+hour_sin,0.6724667571229874
+hour_cos,0.6601352590215553
+recent_failed_auth_count,0.00391011202098072
