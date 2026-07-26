@@ -47,10 +47,9 @@ CREATE TABLE IF NOT EXISTS system_metrics (
     timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     total_logs_processed BIGINT DEFAULT 0,
     total_alerts_flagged BIGINT DEFAULT 0,
-    active_entities_count INT DEFAULT 0,
     avg_inference_latency_ms DOUBLE PRECISION DEFAULT 0.0
 );
 
 -- Insert initial empty metrics row
-INSERT INTO system_metrics (total_logs_processed, total_alerts_flagged, active_entities_count, avg_inference_latency_ms)
-VALUES (0, 0, 200, 14.5);
+INSERT INTO system_metrics (total_logs_processed, total_alerts_flagged, avg_inference_latency_ms)
+VALUES (0, 0, 14.5);

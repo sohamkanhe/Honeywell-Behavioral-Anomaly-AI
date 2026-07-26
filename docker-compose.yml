@@ -74,8 +74,12 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       TOPIC_RAW_LOGS: raw-logs
-      STREAM_INTERVAL_SEC: 1.0
-      ANOMALY_PROBABILITY: 0.025
+      # Fresh events at 4 logs/sec with 1% anomaly rate.
+      STREAM_INTERVAL_SEC: 0.25
+      ANOMALY_PROBABILITY: 0.01
+      BASELINES_PATH: /app/models_and_datasets/baselines.pkl
+    volumes:
+      - ./models_and_datasets:/app/models_and_datasets:ro
     networks:
       - ueba-network
 
@@ -134,7 +138,8 @@ services:
       MINIO_SECRET_KEY: minioadmin
       MINIO_MODEL_BUCKET: ml-models
       MODELS_LOCAL_DIR: /app/models_and_datasets
-      ALERT_ERROR_THRESHOLD: 0.25
+      POINT_AE_MSE_THRESHOLD: 0.00343
+      LSTM_AE_MSE_THRESHOLD: 2.80675
     volumes:
       - ./models_and_datasets:/app/models_and_datasets
     networks:

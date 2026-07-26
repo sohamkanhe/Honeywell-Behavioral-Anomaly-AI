@@ -200,8 +200,60 @@ class FeatureEngineeringWorker:
             logger.error(f"Failed to seed postgres baselines: {e}")
             self.pg_conn.rollback()
 
+    def get_role_peer_baseline(self, role: str) -> Dict[str, Any]:
+        """Constructs a role peer baseline profile for cold-start entities (e.g. new interns)."""
+        role_default_resources = {
+            "Intern / New Hire": ["intern-onboarding-portal", "employee-directory", "slack-workspace", "hr-benefits-portal"],
+            "Software Engineer": ["github-enterprise", "jira-cloud", "confluence", "dev-k8s-cluster", "slack-workspace"],
+            "Executive": ["exec-kpi-dashboard", "email-suite", "board-portal", "slack-workspace"],
+            "Finance & Accounting": ["erp-corporate", "payroll-db", "excel-online", "slack-workspace"],
+            "General Admin": ["employee-directory", "it-helpdesk-ticketing", "slack-workspace", "zoom-video"],
+            "System Service": ["k8s-api-server", "log-collector-agent", "metrics-exporter"],
+            "Edge Sensor": ["sensor-telemetry-endpoint", "iot-gateway"]
+        }
+
+        known_res_set = set(role_default_resources.get(role, ["employee-directory", "slack-workspace"]))
+        known_devs_set = set()
+        durations = []
+        speeds = []
+
+        if self.baselines_file_data:
+            known_res_entity = self.baselines_file_data.get("known_resources_entity", {})
+            known_devs_entity = self.baselines_file_data.get("known_devices_entity", {})
+            dur_stats_entity = self.baselines_file_data.get("duration_stats_entity", {})
+            speed_stats_entity = self.baselines_file_data.get("speed_stats_entity", {})
+
+            for e_id, res_list in known_res_entity.items():
+                known_res_set.update(res_list)
+                if e_id in known_devs_entity:
+                    for d in known_devs_entity[e_id]:
+                        known_devs_set.add(tuple(d))
+                if e_id in dur_stats_entity:
+                    durations.append(dur_stats_entity[e_id].get("mean", 600.0))
+                if e_id in speed_stats_entity:
+                    speeds.append(speed_stats_entity[e_id].get("mean", 0.0))
+
+        dur_mean = float(np.mean(durations)) if durations else 600.0
+        dur_std = float(np.std(durations)) if len(durations) > 1 else 100.0
+        sp_mean = float(np.mean(speeds)) if speeds else 0.0
+        sp_std = float(np.std(speeds)) if len(speeds) > 1 else 1.0
+
+        hour_hist = {str(h): 1.0 / 24.0 for h in range(24)}
+
+        return {
+            "known_resources": list(known_res_set),
+            "known_devices": [list(d) for d in known_devs_set],
+            "duration_mean": dur_mean,
+            "duration_std": max(dur_std, 10.0),
+            "speed_mean": sp_mean,
+            "speed_std": max(sp_std, 0.1),
+            "hour_hist": hour_hist,
+            "is_cold_start": True,
+            "sample_count": 1
+        }
+
     def get_entity_baseline_cache_aside(self, entity_id: str, role: str) -> Dict[str, Any]:
-        """Retrieve entity baseline profile using Redis Cache-Aside pattern."""
+        """Retrieve entity baseline profile using Redis Cache-Aside pattern with Cold Start fallback."""
         cache_key = f"baseline:{entity_id}"
 
         # 1. Try Redis cache
@@ -220,9 +272,16 @@ class FeatureEngineeringWorker:
             row = cur.fetchone()
             cur.close()
             if row:
+                known_res = row["known_resources"] or []
+                known_dev = row["known_devices"] or []
+                if not known_res and self.baselines_file_data:
+                    known_res = list(self.baselines_file_data.get("known_resources_entity", {}).get(entity_id, []))
+                if not known_dev and self.baselines_file_data:
+                    known_dev = [list(p) for p in self.baselines_file_data.get("known_devices_entity", {}).get(entity_id, [])]
+
                 baseline = {
-                    "known_resources": row["known_resources"] or [],
-                    "known_devices": row["known_devices"] or [],
+                    "known_resources": known_res,
+                    "known_devices": known_dev,
                     "duration_mean": row["duration_mean"] or 600.0,
                     "duration_std": row["duration_std"] or 100.0,
                     "speed_mean": row["speed_mean"] or 0.0,
@@ -233,19 +292,48 @@ class FeatureEngineeringWorker:
             logger.error(f"PostgreSQL fetch baseline error: {e}")
             self.pg_conn.rollback()
 
-        # 3. Fallback to pickle or default if not found in PG
+        # 3. Fallback to pickle or Role Peer Baseline (Cold Start mitigation)
         if not baseline:
             dur_stats = self.baselines_file_data.get("duration_stats_entity", {}).get(entity_id, {})
             sp_stats = self.baselines_file_data.get("speed_stats_entity", {}).get(entity_id, {})
-            baseline = {
-                "known_resources": list(self.baselines_file_data.get("known_resources_entity", {}).get(entity_id, [])),
-                "known_devices": [list(p) for p in self.baselines_file_data.get("known_devices_entity", {}).get(entity_id, [])],
-                "duration_mean": dur_stats.get("mean", 600.0),
-                "duration_std": dur_stats.get("std", 100.0),
-                "speed_mean": sp_stats.get("mean", 0.0),
-                "speed_std": sp_stats.get("std", 1.0),
-                "hour_hist": self.baselines_file_data.get("hour_hist_entity", {}).get(entity_id, {})
-            }
+
+            if dur_stats or entity_id in self.baselines_file_data.get("known_resources_entity", {}):
+                baseline = {
+                    "known_resources": list(self.baselines_file_data.get("known_resources_entity", {}).get(entity_id, [])),
+                    "known_devices": [list(p) for p in self.baselines_file_data.get("known_devices_entity", {}).get(entity_id, [])],
+                    "duration_mean": dur_stats.get("mean", 600.0),
+                    "duration_std": dur_stats.get("std", 100.0),
+                    "speed_mean": sp_stats.get("mean", 0.0),
+                    "speed_std": sp_stats.get("std", 1.0),
+                    "hour_hist": self.baselines_file_data.get("hour_hist_entity", {}).get(entity_id, {})
+                }
+            else:
+                # Cold Start for brand new entity/intern! Inherit baseline of peers in that role
+                logger.info(f"❄️ COLD START DETECTED for entity '{entity_id}' (Role: '{role}'). Inheriting role peer baseline...")
+                baseline = self.get_role_peer_baseline(role)
+
+                # Persist to PostgreSQL immediately so DB reflects the new entity baseline
+                try:
+                    cur = self.pg_conn.cursor()
+                    cur.execute("""
+                        INSERT INTO entity_baselines (
+                            entity_id, entity_type, role, known_resources, known_devices,
+                            duration_mean, duration_std, speed_mean, speed_std, hour_hist
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (entity_id) DO NOTHING;
+                    """, (
+                        entity_id, "user", role,
+                        json.dumps(baseline["known_resources"]),
+                        json.dumps(baseline["known_devices"]),
+                        baseline["duration_mean"], baseline["duration_std"],
+                        baseline["speed_mean"], baseline["speed_std"],
+                        json.dumps(baseline["hour_hist"])
+                    ))
+                    self.pg_conn.commit()
+                    cur.close()
+                except Exception as e:
+                    logger.warning(f"Failed to auto-seed cold start entity to Postgres: {e}")
+                    self.pg_conn.rollback()
 
         # 4. Populate Redis with TTL (3600 seconds)
         try:
@@ -316,13 +404,18 @@ class FeatureEngineeringWorker:
             prev_time = datetime.strptime(prev_state["timestamp"], "%Y-%m-%d %H:%M:%S")
 
             dist_km = haversine_km(prev_lat, prev_lon, lat, lon)
-            time_gap_hr = max((timestamp_dt - prev_time).total_seconds() / 3600.0, 1e-6)
-            implied_speed = dist_km / time_gap_hr
+            time_gap_hr = (timestamp_dt - prev_time).total_seconds() / 3600.0
+            # A restarted/replayed data source can legitimately begin before
+            # an old Redis state.  Do not manufacture an impossible velocity
+            # from a negative time delta; the next chronological event will
+            # establish a valid baseline again.
+            if time_gap_hr > 0:
+                implied_speed = dist_km / time_gap_hr
 
-            sp_mean = float(baseline.get("speed_mean", 0.0))
-            sp_std = float(baseline.get("speed_std", 1.0))
-            sp_std = sp_std if sp_std > 0 else 1.0
-            geo_velocity_z = (implied_speed - sp_mean) / sp_std
+                sp_mean = float(baseline.get("speed_mean", 0.0))
+                sp_std = float(baseline.get("speed_std", 1.0))
+                sp_std = sp_std if sp_std > 0 else 1.0
+                geo_velocity_z = (implied_speed - sp_mean) / sp_std
 
         # Update Redis recent state
         try:
@@ -402,6 +495,32 @@ class FeatureEngineeringWorker:
             "feature_vector": full_vector
         }
 
+    def update_entity_baseline_online(self, entity_id: str, raw_log: Dict[str, Any], baseline: Dict[str, Any]):
+        """Online adaptation of entity baseline profile in Redis as new events arrive."""
+        try:
+            res = raw_log.get("resource_accessed")
+            dev = raw_log.get("device_fingerprint")
+            mac = raw_log.get("mac_address")
+
+            updated = False
+            if res and res not in baseline.get("known_resources", []):
+                baseline.setdefault("known_resources", []).append(res)
+                updated = True
+
+            if dev and mac:
+                dev_pair = [dev, mac]
+                known_devs = baseline.get("known_devices", [])
+                if dev_pair not in known_devs:
+                    known_devs.append(dev_pair)
+                    baseline["known_devices"] = known_devs
+                    updated = True
+
+            if updated:
+                cache_key = f"baseline:{entity_id}"
+                self.redis_client.setex(cache_key, 3600, json.dumps(baseline))
+        except Exception as e:
+            logger.warning(f"Failed online update for entity baseline: {e}")
+
     def archive_to_cold_lake(self, raw_log: Dict[str, Any], feature_payload: Dict[str, Any]):
         """Uploads raw log and engineered features to MinIO cold data lake."""
         try:
@@ -444,6 +563,13 @@ class FeatureEngineeringWorker:
 
                 # Archive cold data to MinIO asynchronously / non-blocking
                 self.archive_to_cold_lake(raw_log, feature_payload)
+
+                # Dynamically update entity baseline in Redis as valid events accumulate
+                entity_id = raw_log.get("entity_id")
+                role = raw_log.get("role", "user")
+                if entity_id:
+                    current_baseline = self.get_entity_baseline_cache_aside(entity_id, role)
+                    self.update_entity_baseline_online(entity_id, raw_log, current_baseline)
 
                 processed_count += 1
                 if processed_count % 50 == 0:

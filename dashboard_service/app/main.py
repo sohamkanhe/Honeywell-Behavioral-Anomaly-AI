@@ -101,9 +101,6 @@ def get_system_metrics():
         cur.execute("SELECT COUNT(*) as ack_count FROM alerts WHERE status = 'ACKNOWLEDGED';")
         acknowledged = cur.fetchone()["ack_count"]
 
-        cur.execute("SELECT COUNT(DISTINCT entity_id) as active_entities FROM alerts;")
-        active_entities = cur.fetchone()["active_entities"]
-
         cur.close()
         conn.close()
 
@@ -113,7 +110,6 @@ def get_system_metrics():
                 "total_alerts_flagged": 0,
                 "high_risk_anomalies": 0,
                 "acknowledged_alerts": 0,
-                "active_entities_count": 200,
                 "avg_inference_latency_ms": 14.5
             }
 
@@ -122,7 +118,6 @@ def get_system_metrics():
             "total_alerts_flagged": row.get("total_alerts_flagged", 0),
             "high_risk_anomalies": high_risk,
             "acknowledged_alerts": acknowledged,
-            "active_entities_count": max(active_entities, row.get("active_entities_count", 200)),
             "avg_inference_latency_ms": row.get("avg_inference_latency_ms", 14.5)
         }
     except Exception as e:
@@ -132,7 +127,6 @@ def get_system_metrics():
             "total_alerts_flagged": 0,
             "high_risk_anomalies": 0,
             "acknowledged_alerts": 0,
-            "active_entities_count": 200,
             "avg_inference_latency_ms": 14.5
         }
 

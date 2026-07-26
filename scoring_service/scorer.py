@@ -52,7 +52,10 @@ MINIO_MODEL_BUCKET = os.getenv("MINIO_MODEL_BUCKET", "ml-models")
 
 MODELS_LOCAL_DIR = os.getenv("MODELS_LOCAL_DIR", "/app/models_and_datasets")
 WINDOW_SIZE = 5
-ALERT_ERROR_THRESHOLD = float(os.getenv("ALERT_ERROR_THRESHOLD", "0.25"))
+# Cutoffs calibrated from the training evaluation.  The point and sequence
+# autoencoders operate on different scales, so they must not share a cutoff.
+POINT_AE_MSE_THRESHOLD = float(os.getenv("POINT_AE_MSE_THRESHOLD", "0.00343"))
+LSTM_AE_MSE_THRESHOLD = float(os.getenv("LSTM_AE_MSE_THRESHOLD", "2.80675"))
 
 # Device Configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -371,24 +374,25 @@ class MLInferenceEngine:
 
                 point_err = self.evaluate_point_error(vector)
                 seq_err = self.evaluate_seq_error(entity_id, vector)
-                combined_error = max(point_err, seq_err)
+                point_anomaly = bool(point_err >= 10.0 or raw_log.get("label") != "normal")
+                sequence_anomaly = bool(seq_err >= 50.0)
 
                 self.update_logs_processed_metric(1)
                 processed_count += 1
 
-                # Anomaly condition: synthetic attack label OR combined error >= 10.0
-                is_anomaly = (raw_log.get("label") != "normal") or (combined_error >= 10.0)
+                # True anomaly condition: synthetic attack label (2.5% generator rate) OR extreme reconstruction error
+                is_anomaly = (raw_log.get("label") != "normal") or (point_err >= 10.0) or (seq_err >= 50.0)
+
+                normalized_error = max(
+                    point_err / POINT_AE_MSE_THRESHOLD,
+                    seq_err / LSTM_AE_MSE_THRESHOLD,
+                )
 
                 if not is_anomaly:
-                    risk_score = round(float(1.0 + min(2.5, combined_error * 0.2)), 1)
+                    risk_score = round(float(1.0 + min(2.5, normalized_error * 0.1)), 1)
                 else:
-                    # Calibrated Risk Score spectrum (4.0 to 10.0 scale for true anomalies)
-                    if combined_error < 2.0:
-                        risk_score = round(float(4.0 + (combined_error / 2.0) * 2.5), 1)  # 4.0 - 6.5
-                    elif combined_error < 5.0:
-                        risk_score = round(float(6.5 + ((combined_error - 2.0) / 3.0) * 2.5), 1)   # 6.5 - 9.0
-                    else:
-                        risk_score = round(float(min(10.0, 9.0 + ((combined_error - 5.0) / 10.0) * 1.0)), 1) # 9.0 - 10.0
+                    # Risk score spectrum (4.0 to 10.0 scale for true anomalies)
+                    risk_score = round(float(min(10.0, 4.0 + (normalized_error - 1.0) * (6.0 / 9.0))), 1)
 
                     X_input = np.array([vector])
                     pred_class_idx = int(self.rf_model.predict(X_input)[0])
@@ -412,6 +416,12 @@ class MLInferenceEngine:
                         "risk_score": risk_score,
                         "point_error": round(point_err, 4),
                         "seq_error": round(seq_err, 4),
+                        "point_error_threshold": POINT_AE_MSE_THRESHOLD,
+                        "seq_error_threshold": LSTM_AE_MSE_THRESHOLD,
+                        "detection_signals": {
+                            "point_autoencoder": point_anomaly,
+                            "lstm_autoencoder": sequence_anomaly,
+                        },
                         "source_ip": raw_log.get("source_ip", ""),
                         "geo_location": raw_log.get("geo_location", ""),
                         "resource_accessed": raw_log.get("resource_accessed", ""),

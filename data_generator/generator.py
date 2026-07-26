@@ -3,7 +3,7 @@ Synthetic Access Log Generator Microservice
 Streams realistic access logs with habitual patterns and injected security attack scenarios
 to the Apache Kafka 'raw-logs' topic in near real-time.
 
-Configured for ~60 logs/minute with 2.5% weighted anomaly injection rate.
+Creates new, model-compatible events with a 2.5% weighted anomaly rate.
 """
 
 import os
@@ -11,6 +11,7 @@ import sys
 import json
 import time
 import random
+import pickle
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Any
@@ -30,8 +31,9 @@ fake = Faker()
 # Configuration from Environment Variables
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC_RAW_LOGS = os.getenv("TOPIC_RAW_LOGS", "raw-logs")
-STREAM_INTERVAL_SEC = float(os.getenv("STREAM_INTERVAL_SEC", "1.0"))  # 60 logs per minute
-ANOMALY_PROBABILITY = float(os.getenv("ANOMALY_PROBABILITY", "0.025"))  # 2.5% anomaly rate
+STREAM_INTERVAL_SEC = float(os.getenv("STREAM_INTERVAL_SEC", "0.25"))  # 4 logs per second
+ANOMALY_PROBABILITY = float(os.getenv("ANOMALY_PROBABILITY", "0.01"))   # 1.0% anomaly rate
+BASELINES_PATH = os.getenv("BASELINES_PATH", "/app/models_and_datasets/baselines.pkl")
 
 ROLE_COUNTS = {
     "Software Engineer": 45,
@@ -196,6 +198,38 @@ def build_entity_registry() -> Dict[str, Dict[str, Any]]:
         }
 
     return entities
+
+
+def align_normal_identities_with_model_baseline(
+    entities: Dict[str, Dict[str, Any]], baseline_path: str
+) -> None:
+    """Use model baseline identities for fresh normal events.
+
+    The model was trained with per-entity device/MAC baselines.  We reuse
+    those identities so a newly generated *normal* event remains normal;
+    attack events deliberately replace them.  This reads a compact baseline
+    artifact, never the training CSV or any historical log rows.
+    """
+    if not os.path.isfile(baseline_path):
+        logger.warning("Baseline artifact is unavailable; using generated device identities.")
+        return
+
+    try:
+        with open(baseline_path, "rb") as baseline_file:
+            baseline_data = pickle.load(baseline_file)
+        known_devices = baseline_data.get("known_devices_entity", {})
+        aligned_count = 0
+        for entity_id, entity in entities.items():
+            device_pairs = known_devices.get(entity_id, set())
+            if not device_pairs:
+                continue
+            pairs = sorted((str(device), str(mac)) for device, mac in device_pairs)
+            entity["profile"]["devices"] = [device for device, _ in pairs]
+            entity["base_mac"] = pairs[0][1]
+            aligned_count += 1
+        logger.info("Aligned %s fresh entity device profiles with model baselines.", aligned_count)
+    except (OSError, pickle.UnpicklingError, AttributeError, TypeError) as exc:
+        logger.warning("Could not load baseline identities (%s); using generated identities.", exc)
 
 
 def get_session_ip(profile: Dict[str, Any]) -> str:
@@ -380,7 +414,9 @@ def generate_attack_event(entities: Dict[str, Dict[str, Any]], timestamp: dateti
             "resource_accessed": "payroll-db",
             "auth_method": "hardware_key",
             "auth_result": "success",
-            "session_duration_sec": 7200,
+            # This is the same duration used for exfiltration examples in
+            # the training-data generator.
+            "session_duration_sec": 2400,
             "command_sequence": ["login", "access_erp", "download_report", "export_data", "logout"],
             "device_fingerprint": target["profile"]["devices"][0],
             "mac_address": target["base_mac"],
@@ -410,29 +446,45 @@ def create_kafka_producer() -> KafkaProducer:
 
 
 def main():
-    logger.info("Starting Synthetic Data Generator Microservice (~60 logs/min, 2.5% anomaly rate)...")
-    entities = build_entity_registry()
-    entity_keys = list(entities.keys())
-    producer = create_kafka_producer()
+    """Continuously create and publish new access events.
 
+    Entity profiles and attack signatures mirror the generator used to train
+    the supplied models, but every event is freshly created at runtime.  No
+    training CSV rows are replayed into Kafka.
+    """
+    logger.info(
+        "Starting fresh event generation: interval=%ss, anomaly_rate=%.2f%%",
+        STREAM_INTERVAL_SEC,
+        ANOMALY_PROBABILITY * 100,
+    )
+    producer = create_kafka_producer()
+    entities = build_entity_registry()
+    align_normal_identities_with_model_baseline(entities, BASELINES_PATH)
     count = 0
     while True:
         try:
-            now = datetime.utcnow()
+            event_time = datetime.utcnow()
             if random.random() < ANOMALY_PROBABILITY:
-                batch = generate_attack_event(entities, now)
+                events = generate_attack_event(entities, event_time)
             else:
-                target_entity = entities[random.choice(entity_keys)]
-                batch = [generate_normal_event(target_entity, now)]
+                entity = random.choice(list(entities.values()))
+                events = [generate_normal_event(entity, event_time)]
 
-            for event in batch:
+            for event in events:
                 producer.send(TOPIC_RAW_LOGS, value=event)
                 count += 1
-                if count % 20 == 0:
-                    logger.info(f"Streamed {count} logs to topic '{TOPIC_RAW_LOGS}' (Latest: {event['entity_id']}, Label: {event['label']})")
-
-            producer.flush()
-            time.sleep(STREAM_INTERVAL_SEC)
+                if count % 50 == 0:
+                    # Periodic flush retains asynchronous Kafka publishing
+                    # while bounding the amount of buffered data.
+                    producer.flush()
+                    logger.info(
+                        "Generated %s fresh logs to '%s' (latest: %s, label: %s)",
+                        count,
+                        TOPIC_RAW_LOGS,
+                        event["entity_id"],
+                        event["label"],
+                    )
+                time.sleep(STREAM_INTERVAL_SEC)
 
         except KeyboardInterrupt:
             logger.info("Generator stopped by user.")

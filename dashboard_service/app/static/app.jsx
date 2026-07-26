@@ -218,12 +218,16 @@ function XaiSidePanel({ alertDetail, timelineData, onAcknowledge }) {
             <span style={{ fontFamily: 'var(--font-mono)' }}>{alertDetail.geo_location} ({alertDetail.source_ip})</span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-muted)' }}>Point AE Error:</span>
-            <span style={{ fontFamily: 'var(--font-mono)', color: '#FF3377' }}>{alertDetail.point_error}</span>
+            <span style={{ color: 'var(--text-muted)' }}>Point AE MSE / cutoff:</span>
+            <span style={{ fontFamily: 'var(--font-mono)', color: '#FF3377' }}>
+              {alertDetail.point_error} / {alertDetail.point_error_threshold ?? '0.00343'}
+            </span>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-muted)' }}>LSTM Sequence Error:</span>
-            <span style={{ fontFamily: 'var(--font-mono)', color: '#FF9900' }}>{alertDetail.seq_error}</span>
+            <span style={{ color: 'var(--text-muted)' }}>LSTM MSE / cutoff:</span>
+            <span style={{ fontFamily: 'var(--font-mono)', color: '#FF9900' }}>
+              {alertDetail.seq_error} / {alertDetail.seq_error_threshold ?? '2.80675'}
+            </span>
           </div>
         </div>
 
@@ -466,6 +470,12 @@ function App() {
         setAlerts(data);
         if (data.length > 0 && !selectedAlertId) {
           setSelectedAlertId(data[0].alert_id);
+        } else if (data.length === 0) {
+          // Do not leave a previously selected alert in the XAI panel when
+          // the active queue/filter contains no alerts.
+          setSelectedAlertId(null);
+          setAlertDetail(null);
+          setTimelineData({ recent_events: [] });
         }
       }
     } catch (e) {}
@@ -648,22 +658,22 @@ function App() {
                     <span className="taxonomy-dot"></span> All Threats
                   </div>
                   <div className={`taxonomy-pill ${currentFilter === 'brute_force' ? 'active' : ''}`} onClick={() => setFilter('brute_force')} style={{ color: 'var(--accent-amber)' }}>
-                    <span className="taxonomy-dot"></span> Brute Force (35%)
+                    <span className="taxonomy-dot"></span> Brute Force
                   </div>
                   <div className={`taxonomy-pill ${currentFilter === 'credential_stuffing' ? 'active' : ''}`} onClick={() => setFilter('credential_stuffing')} style={{ color: '#EA580C' }}>
-                    <span className="taxonomy-dot"></span> Credential Stuffing (25%)
+                    <span className="taxonomy-dot"></span> Credential Stuffing
                   </div>
                   <div className={`taxonomy-pill ${currentFilter === 'lateral_movement' ? 'active' : ''}`} onClick={() => setFilter('lateral_movement')} style={{ color: 'var(--accent-magenta)' }}>
-                    <span className="taxonomy-dot"></span> Lateral Movement (15%)
+                    <span className="taxonomy-dot"></span> Lateral Movement
                   </div>
                   <div className={`taxonomy-pill ${currentFilter === 'low_and_slow_exfiltration' ? 'active' : ''}`} onClick={() => setFilter('low_and_slow_exfiltration')} style={{ color: 'var(--accent-purple)' }}>
-                    <span className="taxonomy-dot"></span> Exfiltration (10%)
+                    <span className="taxonomy-dot"></span> Exfiltration
                   </div>
                   <div className={`taxonomy-pill ${currentFilter === 'device_spoofing' ? 'active' : ''}`} onClick={() => setFilter('device_spoofing')} style={{ color: 'var(--accent-cyan)' }}>
-                    <span className="taxonomy-dot"></span> Device Spoofing (10%)
+                    <span className="taxonomy-dot"></span> Device Spoofing
                   </div>
                   <div className={`taxonomy-pill ${currentFilter === 'impossible_travel' ? 'active' : ''}`} onClick={() => setFilter('impossible_travel')} style={{ color: 'var(--accent-red)' }}>
-                    <span className="taxonomy-dot"></span> Impossible Travel (5%)
+                    <span className="taxonomy-dot"></span> Impossible Travel
                   </div>
                 </div>
 
